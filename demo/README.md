@@ -7,8 +7,25 @@ would normally choose which tools to call is replaced here by scripted
 dockerless path).
 
 ```
-PYTHON=.venv/bin/python bash demo/run_demo.sh
+PYTHON=.venv/bin/python bash demo/run_demo.sh          # controlled: fetch + a malicious server
+PYTHON=.venv/bin/python bash demo/run_public_demo.sh   # REAL public servers from npm/PyPI
 ```
+
+## Public-server demo (`run_public_demo.sh`)
+
+Runs mcp-contract against real, widely-used MCP servers pulled straight from the
+public registries (needs `node`/`npx` + internet):
+
+- **Part A** — the flagship `@modelcontextprotocol/server-filesystem` (npm, 14
+  tools): inferred to filesystem-only, network/exec/env denied.
+- **Part B** — a least-privilege table across six public servers (filesystem,
+  fetch, memory, everything, sequential-thinking, time). Pure tools (memory,
+  sequential, time) get **everything denied**; each server is pinned to exactly
+  the capability classes its declared surface implies. The `memory` server
+  actually persists a JSON file it never declares — so `fs.write` is denied and
+  a real disk write would be flagged `outside_contract` at runtime.
+- **Part C** — live hostname egress enforcement on the public fetch server
+  against the **real** GitHub API: `api.github.com` allowed, `example.com` blocked.
 
 Prereqs (demo-only, not framework dependencies):
 
