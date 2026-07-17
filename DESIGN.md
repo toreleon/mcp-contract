@@ -33,7 +33,11 @@ narrowing `values`). There is no separate "approved" status.
 **Host matching** (`net.http` values): exact match (case-insensitive),
 global wildcard `"*"`, suffix wildcard `"*.github.com"` (matches any
 subdomain, **not** `github.com` itself). Values may be hostnames or IPs.
-Port is ignored in v0.
+Port is ignored in v0. Hostname-level `net.http` *enforcement*
+(deny-by-default, 403 on miss) is delivered by the egress proxy — see
+`docs/DESIGN-egress-proxy.md` — which reuses this same `host_matches` rule;
+the docker `/proc/net/tcp` poller only ever sees IPs, so the proxy is what
+makes a granted hostname enforceable at runtime.
 
 **Path matching** (`fs.read`/`fs.write` values): values are path prefixes
 (absolute or `./`-relative). Normalize both sides with
@@ -297,7 +301,11 @@ mounts from granted `fs.read`/`fs.write` values (skip non-absolute values);
 `capabilities()`: network `OBSERVE`, filesystem `ENFORCE` (boot-time mounts,
 no per-open events → document), process `OBSERVE`, syscall `NONE`,
 `boot_time_policy=True`, `runtime_block=True` (block = `docker kill`,
-coarse). `start` shells out to the docker CLI via `subprocess` (no
+coarse). Backend matrix note: with `DockerAdapter(egress_proxy=True)` / CLI
+`--egress-proxy`, network becomes `ENFORCE` at the hostname level via the
+egress proxy (`docs/DESIGN-egress-proxy.md`); the raw-IP bypass remains
+`outside_contract`-flagged by the poller, not blocked, in v0. `start` shells
+out to the docker CLI via `subprocess` (no
 docker-py). `event_stream` polls every `poll_interval`: `docker exec <id>
 cat /proc/net/tcp /proc/net/tcp6` → parse remote endpoints, emit
 `net.connect` for new ones (value is the IP — document that hostname-level
