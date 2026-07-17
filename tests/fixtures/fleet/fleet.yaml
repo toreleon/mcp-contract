@@ -1,0 +1,89 @@
+# mcp-contract fleet config (GO-FORWARD-0.1.0 §4) — MOCK backend, no docker/network.
+#
+# Two label suites:
+#   suite=verify  — four servers over the filesystem manifest that exercise the
+#                   fail-closed exit-code aggregation (clean/exfil/tampered/corrupt).
+#   suite=catalog — one server per real fixture manifest, for infer/audit demos
+#                   (no policy needed for those verbs).
+#
+# Selection labels on the verify suite let a test slice the aggregate:
+#   nodrift=yes  → excludes the tampered (rug-pull) server
+#   novio=yes    → excludes the exfil (violation) server
+version: "0.1"
+
+defaults:
+  backend: mock
+  mode: observe
+  manifest_dir: ../manifests      # resolved relative to this file's directory
+  policy_dir: policies            # resolved relative to this file's directory
+
+servers:
+  # ---- verify suite: all reference the filesystem manifest ----
+  fs-clean:
+    launch: {command: mock}
+    manifest: filesystem.json
+    policy: filesystem-approved.policy.yaml
+    events: events/clean.jsonl
+    labels: {suite: verify, nodrift: "yes", novio: "yes", team: platform, env: prod}
+
+  fs-exfil:
+    launch: {command: mock}
+    manifest: filesystem.json
+    policy: filesystem-approved.policy.yaml
+    events: events/exfil.jsonl
+    labels: {suite: verify, nodrift: "yes", novio: "no", team: platform, env: prod}
+
+  fs-tampered:
+    launch: {command: mock}
+    manifest: filesystem.json
+    policy: filesystem-tampered.policy.yaml
+    events: events/clean.jsonl
+    labels: {suite: verify, nodrift: "no", novio: "yes", team: platform, env: staging}
+
+  fs-corrupt:
+    launch: {command: mock}
+    manifest: filesystem.json
+    policy: filesystem-approved.policy.yaml
+    events: events/corrupt.jsonl
+    labels: {suite: verify, nodrift: "yes", novio: "yes", team: platform, env: prod}
+
+  # ---- catalog suite: one server per real manifest (infer/audit onboarding) ----
+  github:
+    launch:
+      transport: stdio
+      command: docker
+      args: ["run", "-i", "--rm", "mcp/github"]
+      env: {GITHUB_TOKEN: "${GITHUB_TOKEN:-placeholder-token}"}
+    manifest: github.json
+    events: events/clean.jsonl
+    labels: {suite: catalog, team: platform, env: prod, data_class: source-code}
+
+  filesystem:
+    launch: {command: mock}
+    manifest: filesystem.json
+    events: events/clean.jsonl
+    labels: {suite: catalog, team: platform}
+
+  fetch:
+    launch: {command: mock}
+    manifest: fetch.json
+    events: events/clean.jsonl
+    labels: {suite: catalog, team: web}
+
+  shell:
+    launch: {command: mock}
+    manifest: shell.json
+    events: events/clean.jsonl
+    labels: {suite: catalog, team: infra}
+
+  sqlite:
+    launch: {command: mock}
+    manifest: sqlite.json
+    events: events/clean.jsonl
+    labels: {suite: catalog, team: data}
+
+  slack:
+    launch: {command: mock}
+    manifest: slack.json
+    events: events/clean.jsonl
+    labels: {suite: catalog, team: comms, env: prod}

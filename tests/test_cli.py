@@ -566,3 +566,388 @@ def test_run_mock_egress_proxy_prints_noop_note(tmp_path, capsys):
     )
     assert rc == 0
     assert "no effect" in capsys.readouterr().err
+
+
+# ============================================================= export flags
+#
+# `--sarif PATH` / `--siem PATH` on the single-server subcommands and
+# `--emit base` on `infer` are additive: they write standardized artifacts
+# but must never change any exit code (GO-FORWARD §2.6, A4/A5).
+
+
+def _write_approved_fs_policy(policy_path: Path, manifest: Path = FILESYSTEM_MANIFEST) -> Path:
+    """Infer + hand-approve a filesystem policy (fs.read/fs.write -> /data).
+
+    The policy's manifest_hash matches ``manifest`` so verify does not read it
+    as a rug-pull, and granting /data classifies the clean stream within_policy.
+    """
+    from mcp_contract.manifest import load_manifest
+    from mcp_contract.pie.inference import infer_policy
+
+    policy = infer_policy(load_manifest(manifest))
+    for cap in policy.caps:
+        if cap.id in (CapabilityId.FS_READ, CapabilityId.FS_WRITE):
+            cap.status = CapabilityStatus.INFERRED
+            cap.values = ["/data"]
+    dump_policy(policy, policy_path)
+    return policy_path
+
+
+def _sarif_doc(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _ndjson_rows(path: Path) -> list[dict]:
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def test_audit_writes_sarif_and_siem(tmp_path, capsys):
+    policy = _infer_approved_policy(tmp_path)
+    capsys.readouterr()  # drop infer chatter
+    sarif = tmp_path / "audit.sarif"
+    siem = tmp_path / "audit.ndjson"
+    rc = main(
+        ["audit", "--events", str(EXFIL_EVENTS), "--policy", str(policy),
+         "--manifest", str(FILESYSTEM_MANIFEST), "--sarif", str(sarif),
+         "--siem", str(siem)]
+    )
+    assert rc == 0  # audit still never gates
+    doc = _sarif_doc(sarif)
+    assert doc["version"] == "2.1.0"
+    assert "$schema" in doc
+    results = doc["runs"][0]["results"]
+    # the exfil net.connect is outside_contract -> a SARIF result at level error
+    assert any(r["level"] == "error" for r in results)
+    for r in results:
+        assert r["partialFingerprints"]["primaryLocationLineHash"]
+    rows = _ndjson_rows(siem)
+    assert any(row["event.kind"] == "alert" for row in rows)
+    assert any(row.get("destination.address") == "evil.example.com" for row in rows)
+    # flat ECS: no nested dict values in any row
+    for row in rows:
+        assert all(not isinstance(v, dict) for v in row.values())
+
+
+def test_verify_exports_do_not_change_exit_code(tmp_path):
+    policy = _infer_approved_policy(tmp_path)
+    sarif = tmp_path / "verify.sarif"
+    siem = tmp_path / "verify.ndjson"
+    rc = main(
+        ["verify", str(FILESYSTEM_MANIFEST), "--policy", str(policy),
+         "--events", str(EXFIL_EVENTS), "--sarif", str(sarif), "--siem", str(siem)]
+    )
+    assert rc == 1  # violation exit preserved byte-for-byte
+    assert _sarif_doc(sarif)["version"] == "2.1.0"
+    assert _ndjson_rows(siem)
+
+
+def test_verify_clean_exports_are_deterministic(tmp_path):
+    # A5: identical input -> byte-identical SARIF/SIEM across two runs.
+    policy = _infer_approved_policy(tmp_path)
+    outs = []
+    for i in range(2):
+        sarif = tmp_path / f"v{i}.sarif"
+        siem = tmp_path / f"v{i}.ndjson"
+        rc = main(
+            ["verify", str(FILESYSTEM_MANIFEST), "--policy", str(policy),
+             "--events", str(EXFIL_EVENTS), "--sarif", str(sarif), "--siem", str(siem)]
+        )
+        assert rc == 1
+        outs.append((sarif.read_text(encoding="utf-8"), siem.read_text(encoding="utf-8")))
+    assert outs[0] == outs[1]
+
+
+def test_run_mock_writes_sarif_and_siem(tmp_path, capsys):
+    policy = _infer_approved_policy(tmp_path)
+    sarif = tmp_path / "run.sarif"
+    siem = tmp_path / "run.ndjson"
+    rc = main(
+        ["run", str(FILESYSTEM_MANIFEST), "--policy", str(policy),
+         "--backend", "mock", "--mode", "observe",
+         "--events-in", str(EXFIL_EVENTS), "--sarif", str(sarif), "--siem", str(siem)]
+    )
+    assert rc == 1  # critical severity exit preserved
+    assert _sarif_doc(sarif)["runs"][0]["results"]
+    assert _ndjson_rows(siem)
+
+
+def test_infer_emit_base_strict_projection(tmp_path, capsys):
+    # github grants net.http api.github.com -> base carries permissions.network,
+    # and the base doc is the strict policy-mcp/v1 form (no x-mcp-contract).
+    out_path = tmp_path / "github.base.yaml"
+    rc = main(
+        ["infer", str(MANIFESTS / "github.json"), "--emit", "base", "-o", str(out_path)]
+    )
+    assert rc == 0
+    doc = yaml.safe_load(out_path.read_text(encoding="utf-8"))
+    assert set(doc) <= {"version", "description", "permissions"}
+    assert "x-mcp-contract" not in doc
+    hosts = [g["host"] for g in doc["permissions"]["network"]["allow"]]
+    assert "api.github.com" in hosts
+
+
+def test_infer_default_emit_unchanged(tmp_path, capsys):
+    # --emit full (the default) must keep the existing full document, so the
+    # x-mcp-contract goldens/round-trip stay byte-identical.
+    assert main(["infer", str(MANIFESTS / "github.json")]) == 0
+    doc = yaml.safe_load(capsys.readouterr().out)
+    assert "x-mcp-contract" in doc
+    assert {c["id"] for c in doc["x-mcp-contract"]["caps"]} == {
+        "net.http", "fs.read", "fs.write", "proc.exec", "env"
+    }
+
+
+# ================================================================== fleet
+#
+# The `fleet` group runs the single-server verbs in batch. Configs are built
+# in tmp_path (never depending on tests/fixtures/fleet/, owned in parallel).
+# All servers use the mock backend and replay the bundled JSONL fixtures.
+
+
+def _write_fleet_config(
+    path: Path, servers: dict, defaults: dict | None = None
+) -> Path:
+    doc: dict = {"version": "0.1"}
+    if defaults:
+        doc["defaults"] = defaults
+    doc["servers"] = servers
+    path.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+    return path
+
+
+def _mock_server(manifest: Path, policy: Path | None, events: Path | None, **extra) -> dict:
+    entry: dict = {
+        "launch": {"command": "true"},
+        "backend": "mock",
+        "manifest": str(manifest),
+    }
+    if policy is not None:
+        entry["policy"] = str(policy)
+    if events is not None:
+        entry["events"] = str(events)
+    entry.update(extra)
+    return entry
+
+
+def test_fleet_infer_over_manifests_dir_writes_six_policies(tmp_path, capsys):
+    outdir = tmp_path / "policies"
+    rc = main(["fleet", "infer", str(MANIFESTS), "-o", str(outdir)])
+    out, err = capsys.readouterr()
+    assert rc == 0
+    written = sorted(p.stem.replace(".policy", "") for p in outdir.glob("*.policy.yaml"))
+    assert set(written) == {"github", "filesystem", "fetch", "shell", "sqlite", "slack"}
+    report = json.loads(out)
+    assert len(report["runs"]) == 6
+
+
+def test_fleet_infer_ndjson_to_stdout(tmp_path, capsys):
+    rc = main(["fleet", "infer", str(MANIFESTS), "--format", "ndjson"])
+    out, err = capsys.readouterr()
+    assert rc == 0
+    rows = [json.loads(line) for line in out.splitlines() if line.strip()]
+    assert len(rows) == 6
+    assert {row["server_id"] for row in rows} == {
+        "github", "filesystem", "fetch", "shell", "sqlite", "slack"
+    }
+
+
+def test_fleet_infer_requires_exactly_one_source(tmp_path, capsys):
+    rc = main(["fleet", "infer"])
+    assert rc == 4
+    assert "exactly one" in capsys.readouterr().err.lower()
+
+
+def test_fleet_infer_emit_base_writes_strict_projection(tmp_path, capsys):
+    outdir = tmp_path / "base"
+    rc = main(
+        ["fleet", "infer", str(MANIFESTS / "github.json"), "-o", str(outdir),
+         "--emit", "base"]
+    )
+    assert rc == 0
+    doc = yaml.safe_load((outdir / "github.policy.yaml").read_text(encoding="utf-8"))
+    assert "x-mcp-contract" not in doc
+    assert set(doc) <= {"version", "description", "permissions"}
+
+
+def test_fleet_infer_from_mcp_ingests_server_ids(tmp_path, capsys):
+    mcp = tmp_path / ".mcp.json"
+    mcp.write_text(
+        json.dumps({"mcpServers": {"github": {"command": "docker",
+                    "args": ["run", "-i", "--rm", "mcp/github"]}}}),
+        encoding="utf-8",
+    )
+    # An mcpServers file carries no manifests, so infer can only ingest and
+    # skip; assert the server was ingested by id.
+    main(["fleet", "infer", "--from-mcp", str(mcp), "--format", "ndjson"])
+    out, _ = capsys.readouterr()
+    rows = [json.loads(line) for line in out.splitlines() if line.strip()]
+    assert any(row["server_id"] == "github" for row in rows)
+
+
+def test_fleet_verify_mixed_clean_and_exfil_exits_one(tmp_path):
+    policy = _write_approved_fs_policy(tmp_path / "fs.policy.yaml")
+    cfg = _write_fleet_config(
+        tmp_path / "fleet.yaml",
+        {
+            "fs-clean": _mock_server(FILESYSTEM_MANIFEST, policy, CLEAN_EVENTS,
+                                     labels={"env": "prod"}),
+            "fs-exfil": _mock_server(FILESYSTEM_MANIFEST, policy, EXFIL_EVENTS,
+                                     labels={"env": "staging"}),
+        },
+    )
+    rc = main(["fleet", "verify", "--config", str(cfg)])
+    assert rc == 1
+
+
+def test_fleet_verify_rugpull_outranks_violation_exits_two(tmp_path):
+    policy = _write_approved_fs_policy(tmp_path / "fs.policy.yaml")
+    tampered = _tampered_manifest(tmp_path)
+    cfg = _write_fleet_config(
+        tmp_path / "fleet.yaml",
+        {
+            "fs-exfil": _mock_server(FILESYSTEM_MANIFEST, policy, EXFIL_EVENTS),
+            "fs-rugpull": _mock_server(tampered, policy, CLEAN_EVENTS),
+        },
+    )
+    rc = main(["fleet", "verify", "--config", str(cfg)])
+    assert rc == 2  # 2 > 1: a changed manifest invalidates the comparison
+
+
+def test_fleet_verify_bad_input_exits_four(tmp_path):
+    policy = _write_approved_fs_policy(tmp_path / "fs.policy.yaml")
+    cfg = _write_fleet_config(
+        tmp_path / "fleet.yaml",
+        {
+            "fs-clean": _mock_server(FILESYSTEM_MANIFEST, policy, CLEAN_EVENTS),
+            "fs-missing": _mock_server(FILESYSTEM_MANIFEST, policy,
+                                       tmp_path / "nope.jsonl"),
+        },
+    )
+    rc = main(["fleet", "verify", "--config", str(cfg)])
+    assert rc == 4  # operational, never 1/2; a broken pipeline is not "clean"
+
+
+def test_fleet_verify_select_filters_servers(tmp_path):
+    policy = _write_approved_fs_policy(tmp_path / "fs.policy.yaml")
+    cfg = _write_fleet_config(
+        tmp_path / "fleet.yaml",
+        {
+            "fs-clean": _mock_server(FILESYSTEM_MANIFEST, policy, CLEAN_EVENTS,
+                                     labels={"env": "prod"}),
+            "fs-exfil": _mock_server(FILESYSTEM_MANIFEST, policy, EXFIL_EVENTS,
+                                     labels={"env": "staging"}),
+        },
+    )
+    # selecting only the clean (prod) server drops the exfil violation -> clean
+    rc = main(["fleet", "verify", "--config", str(cfg), "--select", "env=prod"])
+    assert rc == 0
+
+
+def test_fleet_verify_writes_sarif_and_siem(tmp_path):
+    policy = _write_approved_fs_policy(tmp_path / "fs.policy.yaml")
+    cfg = _write_fleet_config(
+        tmp_path / "fleet.yaml",
+        {"fs-exfil": _mock_server(FILESYSTEM_MANIFEST, policy, EXFIL_EVENTS)},
+    )
+    sarif = tmp_path / "fleet.sarif"
+    siem = tmp_path / "fleet.ndjson"
+    rc = main(
+        ["fleet", "verify", "--config", str(cfg), "--sarif", str(sarif),
+         "--siem", str(siem)]
+    )
+    assert rc == 1
+    assert _sarif_doc(sarif)["version"] == "2.1.0"
+    assert any(row["event.kind"] == "alert" for row in _ndjson_rows(siem))
+
+
+def test_fleet_verify_report_is_deterministic(tmp_path):
+    # A3: with fixed inputs the aggregate report is byte-stable across runs
+    # when a started_at is fixed. The CLI does not fix started_at, so compare
+    # everything except the wall-clock generated_at field.
+    policy = _write_approved_fs_policy(tmp_path / "fs.policy.yaml")
+    cfg = _write_fleet_config(
+        tmp_path / "fleet.yaml",
+        {"fs-clean": _mock_server(FILESYSTEM_MANIFEST, policy, CLEAN_EVENTS)},
+    )
+    docs = []
+    for i in range(2):
+        out_path = tmp_path / f"report{i}.json"
+        rc = main(["fleet", "verify", "--config", str(cfg), "--report", str(out_path)])
+        assert rc == 0
+        doc = json.loads(out_path.read_text(encoding="utf-8"))
+        doc.pop("generated_at", None)
+        docs.append(doc)
+    assert docs[0] == docs[1]
+
+
+def test_fleet_audit_reports_without_gating(tmp_path, capsys):
+    policy = _write_approved_fs_policy(tmp_path / "fs.policy.yaml")
+    cfg = _write_fleet_config(
+        tmp_path / "fleet.yaml",
+        {"fs-exfil": _mock_server(FILESYSTEM_MANIFEST, policy, EXFIL_EVENTS)},
+    )
+    rc = main(["fleet", "audit", "--config", str(cfg)])
+    out, _ = capsys.readouterr()
+    assert rc == 0  # audit reports, never gates, even with a violation
+    report = json.loads(out)
+    assert report["runs"]
+
+
+FLEET_FIXTURE_CONFIG = FIXTURES / "fleet" / "fleet.yaml"
+
+
+def test_fleet_verify_zero_servers_selected_is_inconclusive_not_clean(capsys):
+    """The 'CI green on a compromised fleet' guard (finding 1): a --select that
+    matches no server examined nothing, so the gate is inconclusive (exit 4),
+    never clean (exit 0) — even though the correctly-selected suite=verify slice
+    (which contains the rug-pulled fs-tampered server) returns 2."""
+    rc_none = main(
+        ["fleet", "verify", "--config", str(FLEET_FIXTURE_CONFIG),
+         "--select", "environment=prod"]  # real label key is 'env', not 'environment'
+    )
+    assert rc_none == 4
+    assert "0 server(s)" in capsys.readouterr().err
+    rc_suite = main(
+        ["fleet", "verify", "--config", str(FLEET_FIXTURE_CONFIG),
+         "--select", "suite=verify"]
+    )
+    assert rc_suite == 2  # rug_pull present in the correctly-selected slice
+
+
+def test_fleet_verify_empty_servers_block_is_inconclusive_not_clean(tmp_path, capsys):
+    # A config whose `servers:` block is emptied (e.g. during an edit) must not
+    # read as a clean fleet either.
+    cfg = _write_fleet_config(tmp_path / "empty.yaml", {})
+    rc = main(["fleet", "verify", "--config", str(cfg)])
+    assert rc == 4
+    assert "0 server(s)" in capsys.readouterr().err
+
+
+def test_fleet_run_zero_servers_selected_is_inconclusive_not_clean(tmp_path, capsys):
+    policy = _write_approved_fs_policy(tmp_path / "fs.policy.yaml")
+    cfg = _write_fleet_config(
+        tmp_path / "fleet.yaml",
+        {"fs-clean": _mock_server(FILESYSTEM_MANIFEST, policy, CLEAN_EVENTS,
+                                  labels={"env": "prod"})},
+    )
+    rc = main(["fleet", "run", "--config", str(cfg), "--select", "env=nope"])
+    assert rc == 4
+    assert "0 server(s)" in capsys.readouterr().err
+
+
+def test_fleet_verify_clean_siem_is_zero_byte_not_blank_line(tmp_path):
+    """An all-clean fleet writes a 0-byte SIEM artifact, not a lone blank line
+    that would break a strict JSON-lines forwarder (finding 7)."""
+    policy = _write_approved_fs_policy(tmp_path / "fs.policy.yaml")
+    cfg = _write_fleet_config(
+        tmp_path / "fleet.yaml",
+        {"fs-clean": _mock_server(FILESYSTEM_MANIFEST, policy, CLEAN_EVENTS)},
+    )
+    siem = tmp_path / "clean.ndjson"
+    rc = main(["fleet", "verify", "--config", str(cfg), "--siem", str(siem)])
+    assert rc == 0
+    assert siem.read_text(encoding="utf-8") == ""  # 0-byte, not "\n"

@@ -71,13 +71,47 @@ a CI-gate sketch lives in [examples/github-action.yml](examples/github-action.ym
 
 | Command | What it does | Exit codes |
 |---|---|---|
-| `infer MANIFEST [-o FILE] [--json]` | manifest → policy YAML; `needs_review` summary on stderr | 0 |
-| `run MANIFEST --policy P --backend {docker,mock} --mode {observe,alert,enforce} [--egress-proxy]` | start (or replay) the server, monitor live, optionally write events/report; `--egress-proxy` (docker only) turns on hostname-level network **enforcement** | 0 ok/warning, 1 critical, 3 manifest drift, 4 missing/corrupt input |
-| `audit --events E --policy P --manifest M [--json]` | offline classification report | 0 (it reports, it never gates); 4 missing/corrupt input |
-| `verify MANIFEST --policy P --events E [--allow-empty]` | the CI gate | 0 clean, 1 outside-contract event, 2 manifest hash mismatch (rug-pull), 4 inconclusive (missing/corrupt input, or zero events observed — never a security signal) |
+| `infer MANIFEST [-o FILE] [--json] [--emit {full,base}]` | manifest → policy YAML; `needs_review` summary on stderr. `--emit base` writes the strict policy-mcp/v1 projection (schema-valid, no `x-mcp-contract`) instead of the full document | 0 |
+| `run MANIFEST --policy P --backend {docker,mock} --mode {observe,alert,enforce} [--egress-proxy] [--sarif PATH] [--siem PATH]` | start (or replay) the server, monitor live, optionally write events/report; `--egress-proxy` (docker only) turns on hostname-level network **enforcement**; `--sarif`/`--siem` write standardized reports as extra artifacts | 0 ok/warning, 1 critical, 3 manifest drift, 4 missing/corrupt input |
+| `audit --events E --policy P --manifest M [--json] [--sarif PATH] [--siem PATH]` | offline classification report; `--sarif`/`--siem` write standardized reports | 0 (it reports, it never gates); 4 missing/corrupt input |
+| `verify MANIFEST --policy P --events E [--allow-empty] [--sarif PATH] [--siem PATH]` | the CI gate; `--sarif`/`--siem` write standardized reports (exit code unchanged) | 0 clean, 1 outside-contract event, 2 manifest hash mismatch (rug-pull), 4 inconclusive (missing/corrupt input, or zero events observed — never a security signal) |
 | `proxy [--allow HOST ...] [--policy P] [--host H] [--port N] [--events-out FILE]` | run the enforcing egress proxy standalone (deny-by-default); logs every allowed/denied attempt as JSONL to stdout; runs until Ctrl-C | 0 clean shutdown |
 
+The `--sarif PATH` / `--siem PATH` flags are **additive** — they emit a SARIF
+2.1.0 report (CI / GitHub code-scanning) and ECS-aligned NDJSON (SIEM) as extra
+artifacts and never change the exit code.
+
 Machine output (YAML/JSON) goes to stdout, human chatter to stderr.
+
+### CLI — fleet
+
+The `fleet` group runs the single-server verbs in batch across a fleet of MCP
+servers (a native `fleet.yaml`, an `mcpServers`/VS Code servers file via
+`--from-mcp`, or a manifest DIR/GLOB for zero-config `infer`). Every verb
+produces one aggregate `FleetReport`; `--select K=V` slices the fleet by label.
+
+| Command | What it does | Exit codes |
+|---|---|---|
+| `fleet infer (DIR\|GLOB \| --config F \| --from-mcp F) [-o OUTDIR] [--emit {full,base}] [--report FILE] [--format {json,ndjson,sarif}] [--select K=V]` | infer a least-privilege policy per server; write them to `OUTDIR` and emit one aggregate report | 0, or 4 if a bad/unresolved input made a server skip |
+| `fleet audit --config F [--select K=V] [--report FILE] [--format {json,ndjson,sarif}]` | offline classification across the fleet; reports only | 0 (never gates); 4 bad input |
+| `fleet verify --config F [--select K=V] [--allow-empty] [--report FILE] [--format {json,ndjson,sarif}] [--sarif PATH] [--siem PATH]` | the fleet CI gate — aggregate exit code | 0 clean, 1 any outside-contract, 2 any rug-pull, 4 any bad/inconclusive input (**precedence 2 > 1 > 4 > 0**) |
+| `fleet run --config F [--select K=V] [--report-out FILE] [--max-events N] [--duration S] [--siem PATH]` | start/monitor each server (sequential in v0); aggregate exit code | 0 clean, 1 violation, 2 drift/rug-pull, 4 bad input |
+
+`--format` selects the aggregate report shape written to `--report FILE` (or
+stdout): `json` (`FleetReport.to_json()`), `ndjson` (one `FleetServerReport` per
+line), or `sarif` (`to_sarif_json` over all per-server reports). The aggregate
+precedence puts a rug-pull (2) ahead of a plain violation (1) — a changed
+manifest invalidates the whole comparison — and keeps 4 last so a broken
+pipeline never reads as clean.
+
+```bash
+# zero-config: infer least-privilege policies for a directory of manifests
+mcp-contract fleet infer tests/fixtures/manifests/ -o policies/
+
+# gate a whole fleet in CI, emitting SARIF + SIEM alongside the exit code
+mcp-contract fleet verify --config fleet.yaml \
+    --sarif fleet.sarif --siem fleet.ndjson
+```
 
 ## Network enforcement: the egress proxy
 
@@ -139,7 +173,7 @@ drains the proxy's hostname-level events alongside the IP-level poller events.
 | **M2** BCM diffing + `verify` CI gate | **Shipped.** Three-bucket classification, `verify` exit codes, GitHub Action sketch, fixture-backed e2e tests. |
 | **M3** `policy-mcp` upstream PR + gVisor adapter | **Not started.** Upstream-PR material is collected in `docs/policy-mcp-notes.md`; no gVisor adapter yet. |
 | **M4** enforce mode + rug-pull detection | **Partial.** Rug-pull gate is real (`verify` exit 2, `ManifestDriftError` at monitor start). Enforce mode exists; docker per-event "block" is coarse (kill the container), but hostname-level egress is enforced deny-by-default by the egress proxy (`--egress-proxy`). Raw-IP bypass is still only flagged, not blocked (needs internal-network + iptables). |
-| **M5** report/SIEM export + fleet API | **Partial.** Per-run JSON report export only; no fleet API. |
+| **M5** report/SIEM export + fleet API | **Shipped.** `fleet infer\|audit\|verify\|run` batch verbs over an importable `mcp_contract.fleet` API (one aggregate `FleetReport`); standardized reporting via `mcp_contract.report` — SARIF 2.1.0 for CI code-scanning and ECS-aligned NDJSON for SIEM — surfaced as `--sarif PATH`/`--siem PATH` on `audit`/`verify`/`run` and `--format {json,ndjson,sarif}` on the `fleet` group. |
 | **M6** v1.0 + infra-team pilot | **Not started.** |
 
 ## Backend capability matrix
@@ -183,6 +217,8 @@ should provide.
 
 ## Library usage
 
+Single server — infer, then classify a recorded stream:
+
 ```python
 from mcp_contract.manifest import load_manifest
 from mcp_contract.pie.inference import infer_policy
@@ -198,6 +234,36 @@ report = classify_events(events, policy, manifest)
 print(report.severity.value)          # "critical"
 for event in report.violations:
     print(event.kind.value, event.detail, "during", event.tool_ctx)
+```
+
+Whole fleet — infer or gate many servers, with a deterministic aggregate report:
+
+```python
+from mcp_contract.fleet import Fleet, FleetReport
+
+# zero-config onboarding: one server per manifest file
+fleet = Fleet.from_manifests(["tests/fixtures/manifests/filesystem.json"])
+report: FleetReport = fleet.infer_all(write=False, started_at=0.0)
+print(report.exit_code())             # 0 (nothing gated on infer)
+
+# or gate a configured fleet in CI (started_at fixes timestamps for byte-stable output)
+import json
+
+fleet = Fleet.from_config("fleet.yaml").select(env="prod")
+report = fleet.verify_all(started_at=0.0)
+open("fleet.json", "w").write(report.to_json())          # aggregate, deterministic
+open("fleet.sarif", "w").write(json.dumps(report.to_sarif()))   # CI code-scanning
+open("fleet.ndjson", "w").write(report.to_siem_ndjson())        # SIEM
+raise SystemExit(report.exit_code())  # 2 > 1 > 4 > 0
+```
+
+Standalone report export (any `list[ViolationReport]`):
+
+```python
+from mcp_contract.report import to_sarif_json, to_siem_ndjson, violation_identity
+
+open("out.sarif", "w").write(to_sarif_json([report_a, report_b]))
+open("out.ndjson", "w").write(to_siem_ndjson([report_a, report_b]))
 ```
 
 ## Development
