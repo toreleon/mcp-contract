@@ -5,13 +5,26 @@ Stdout carries machine output (YAML/JSON); stderr carries human chatter.
 """
 from __future__ import annotations
 
+import http.client
+import http.server
 import json
+import threading
+import time
 from pathlib import Path
 
+import pytest
 import yaml
 
+import mcp_contract.cli as cli_module
 from mcp_contract.cli import main
-from mcp_contract.models import BehaviorEvent
+from mcp_contract.models import (
+    BehaviorEvent,
+    Capability,
+    CapabilityId,
+    CapabilityStatus,
+    Policy,
+)
+from mcp_contract.policy import dump_policy
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 MANIFESTS = FIXTURES / "manifests"
@@ -351,3 +364,205 @@ def test_fixture_event_streams_parse_and_diverge():
     assert len(evil) == 1
     assert evil[0]["detail"]["host"] == "evil.example.com"
     assert evil[0]["tool_ctx"] == "read_file"
+
+
+# ---------------------------------------------------------------- proxy
+#
+# The `proxy` subcommand runs the enforcing egress proxy standalone. These
+# tests drive it entirely in-process on an ephemeral 127.0.0.1 port against a
+# local sentinel "upstream" — no docker, no real network. `main` blocks until
+# the proxy is torn down, so the work happens inside `cli._PROXY_SERVE_HOOK`:
+# it receives the bound proxy, drives clients, waits for the events, and
+# returns, at which point `main` stops the proxy and exits 0.
+
+
+class _Sentinel:
+    """A local 127.0.0.1 upstream that counts every request it receives.
+
+    Used as the "allowed" target so an allowed CONNECT tunnels through to a
+    real server, while a denied CONNECT must never reach it (hit count stays
+    put) — the load-bearing deny-by-default invariant.
+    """
+
+    def __init__(self) -> None:
+        self.hits = 0
+        self._lock = threading.Lock()
+        sentinel = self
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802 - stdlib callback name
+                with sentinel._lock:
+                    sentinel.hits += 1
+                body = b"sentinel-ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args: object) -> None:  # keep test output quiet
+                pass
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self.port: int = self._server.server_address[1]
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    def __enter__(self) -> _Sentinel:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
+def _tunnel_get(proxy_port: int, host: str, upstream_port: int) -> tuple[int, bytes]:
+    """CONNECT host:upstream_port through the proxy, then GET / over the tunnel.
+
+    Returns (status, body) on success. Raises OSError (with the proxy status
+    in the message) when the proxy refuses the CONNECT — how http.client
+    surfaces a 403 from a proxy.
+    """
+    conn = http.client.HTTPConnection("127.0.0.1", proxy_port, timeout=5)
+    conn.set_tunnel(host, upstream_port)
+    try:
+        conn.request("GET", "/")
+        resp = conn.getresponse()
+        return resp.status, resp.read()
+    finally:
+        conn.close()
+
+
+def _wait_for_events(proxy: object, count: int) -> None:
+    """Block (bounded) until the proxy has recorded `count` attempts.
+
+    The proxy appends to `events` and invokes the on_event print callback
+    under one lock, so once the count is reached the JSONL is on its way out;
+    a short grace lets the final line flush before teardown.
+    """
+    deadline = time.time() + 5.0
+    while len(proxy.events) < count and time.time() < deadline:  # type: ignore[attr-defined]
+        time.sleep(0.01)
+    time.sleep(0.1)
+
+
+def _write_net_policy(path: Path, hosts: list[str]) -> None:
+    """Write a policy YAML that grants net.http for `hosts` and denies the rest."""
+    caps = [
+        Capability(
+            id=cid,
+            status=(
+                CapabilityStatus.INFERRED
+                if cid is CapabilityId.NET_HTTP
+                else CapabilityStatus.DENIED
+            ),
+            values=list(hosts) if cid is CapabilityId.NET_HTTP else [],
+        )
+        for cid in CapabilityId
+    ]
+    dump_policy(Policy(server_id="proxy-test", manifest_hash="sha256:0", caps=caps), path)
+
+
+def test_proxy_allow_enforces_in_process(capsys):
+    with _Sentinel() as sentinel:
+        captured: list = []
+
+        def _driver(proxy: object) -> None:
+            captured.append(proxy)
+            port = proxy.port  # type: ignore[attr-defined]
+            # allowed host (the sentinel) tunnels through and succeeds
+            status, body = _tunnel_get(port, "127.0.0.1", sentinel.port)
+            assert status == 200
+            assert body == b"sentinel-ok"
+            # denied host is 403'd by the proxy and never dialled upstream
+            with pytest.raises(OSError) as excinfo:
+                _tunnel_get(port, "blocked.example", sentinel.port)
+            assert "403" in str(excinfo.value)
+            _wait_for_events(proxy, 2)
+
+        cli_module._PROXY_SERVE_HOOK = _driver
+        try:
+            rc = main(["proxy", "--allow", "127.0.0.1", "--host", "127.0.0.1",
+                       "--port", "0"])
+        finally:
+            cli_module._PROXY_SERVE_HOOK = None
+
+    assert rc == 0
+    # deny-by-default invariant: the denied host never reached the sentinel
+    assert sentinel.hits == 1
+
+    proxy = captured[0]
+    decisions = {e.detail["host"]: e.detail["allowed"] for e in proxy.events}
+    assert decisions == {"127.0.0.1": True, "blocked.example": False}
+
+    out, err = capsys.readouterr()
+    lines = [json.loads(ln) for ln in out.splitlines() if ln.strip()]
+    assert len(lines) == 2
+    for d in lines:
+        assert d["kind"] == "net.connect"
+        assert d["detail"]["via"] == "proxy"
+        assert d["backend"] == "egress-proxy"
+    stdout_decisions = {d["detail"]["host"]: d["detail"]["allowed"] for d in lines}
+    assert stdout_decisions == {"127.0.0.1": True, "blocked.example": False}
+    assert "listening on 127.0.0.1:" in err
+    assert "stopped" in err
+
+
+def test_proxy_events_out_file(tmp_path, capsys):
+    events_out = tmp_path / "proxy-events.jsonl"
+    with _Sentinel() as sentinel:
+
+        def _driver(proxy: object) -> None:
+            status, _ = _tunnel_get(proxy.port, "127.0.0.1", sentinel.port)  # type: ignore[attr-defined]
+            assert status == 200
+            _wait_for_events(proxy, 1)
+
+        cli_module._PROXY_SERVE_HOOK = _driver
+        try:
+            rc = main(["proxy", "--allow", "127.0.0.1", "--port", "0",
+                       "--events-out", str(events_out)])
+        finally:
+            cli_module._PROXY_SERVE_HOOK = None
+
+    assert rc == 0
+    lines = [
+        json.loads(ln)
+        for ln in events_out.read_text(encoding="utf-8").splitlines()
+        if ln.strip()
+    ]
+    assert len(lines) == 1
+    assert lines[0]["detail"]["host"] == "127.0.0.1"
+    assert lines[0]["detail"]["allowed"] is True
+
+
+def test_proxy_policy_derives_allowlist(tmp_path, capsys):
+    policy_path = tmp_path / "net.policy.yaml"
+    _write_net_policy(policy_path, ["127.0.0.1"])
+    with _Sentinel() as sentinel:
+
+        def _driver(proxy: object) -> None:
+            status, _ = _tunnel_get(proxy.port, "127.0.0.1", sentinel.port)  # type: ignore[attr-defined]
+            assert status == 200
+            with pytest.raises(OSError):
+                _tunnel_get(proxy.port, "nope.example", sentinel.port)  # type: ignore[attr-defined]
+            _wait_for_events(proxy, 2)
+
+        cli_module._PROXY_SERVE_HOOK = _driver
+        try:
+            rc = main(["proxy", "--policy", str(policy_path), "--port", "0"])
+        finally:
+            cli_module._PROXY_SERVE_HOOK = None
+
+    assert rc == 0
+    assert sentinel.hits == 1  # only the allowed host reached upstream
+    assert "mode=allowlist" in capsys.readouterr().err
+
+
+def test_run_mock_egress_proxy_prints_noop_note(tmp_path, capsys):
+    policy = _infer_approved_policy(tmp_path)
+    rc = main(
+        ["run", str(FILESYSTEM_MANIFEST), "--policy", str(policy),
+         "--backend", "mock", "--mode", "observe",
+         "--events-in", str(CLEAN_EVENTS), "--egress-proxy"]
+    )
+    assert rc == 0
+    assert "no effect" in capsys.readouterr().err

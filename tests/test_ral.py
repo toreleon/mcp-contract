@@ -25,8 +25,11 @@ from mcp_contract.ral import RuntimeAdapter, ServerSpec, SupportLevel, get_adapt
 from mcp_contract.ral.docker import (
     DockerAdapter,
     _decode_proc_addr,
+    _ProxyChannel,
+    parse_default_gateway,
     parse_docker_top,
     parse_proc_net_tcp,
+    translate_network_args,
     translate_policy_args,
 )
 from mcp_contract.ral.mock import MockAdapter
@@ -261,6 +264,71 @@ class TestTranslatePolicyArgs:
 
 
 # ---------------------------------------------------------------------------
+# translate_network_args (pure, no docker needed)
+# ---------------------------------------------------------------------------
+#
+# EgressPlan is imported locally inside each test: the proxy package is built
+# in parallel (Module P), so a top-level import would break collection of the
+# whole file during the parallel window. These run once Module P lands.
+
+
+class TestTranslateNetworkArgs:
+    def test_proxy_endpoint_sets_env_and_add_host_no_network_none(self) -> None:
+        from mcp_contract.proxy.plan import EgressPlan
+
+        plan = EgressPlan(mode="allowlist", hosts=["api.github.com"])
+        ep = "http://host.docker.internal:54321"
+        args = translate_network_args(plan, ep, ServerSpec(server_id="srv"))
+        # Both casings of both proxy vars, all pointing at the proxy endpoint.
+        assert _flag_values(args, "-e") == [
+            f"HTTP_PROXY={ep}",
+            f"HTTPS_PROXY={ep}",
+            f"http_proxy={ep}",
+            f"https_proxy={ep}",
+        ]
+        assert "--add-host=host.docker.internal:host-gateway" in args
+        # The container keeps bridge networking so it can reach the proxy — a
+        # denied host is stopped by the proxy, not by cutting the network.
+        assert "--network" not in args
+        assert "none" not in args
+
+    def test_deny_without_proxy_is_network_none(self) -> None:
+        from mcp_contract.proxy.plan import EgressPlan
+
+        plan = EgressPlan(mode="deny", hosts=[])
+        args = translate_network_args(plan, None, ServerSpec(server_id="srv"))
+        assert args == ["--network", "none"]  # fail closed
+
+    def test_open_without_proxy_has_no_network_flag(self) -> None:
+        from mcp_contract.proxy.plan import EgressPlan
+
+        plan = EgressPlan(mode="open", hosts=[])
+        args = translate_network_args(plan, None, ServerSpec(server_id="srv"))
+        assert args == []  # default bridge, observe-only
+
+    def test_allowlist_without_proxy_has_no_network_flag(self) -> None:
+        from mcp_contract.proxy.plan import EgressPlan
+
+        # No proxy => allowlist can't be enforced at the hostname level; the
+        # default bridge is used (observe-only). That's the point of the proxy.
+        plan = EgressPlan(mode="allowlist", hosts=["api.github.com"])
+        args = translate_network_args(plan, None, ServerSpec(server_id="srv"))
+        assert args == []
+
+    def test_proxy_endpoint_wins_regardless_of_deny_mode(self) -> None:
+        # If a proxy_endpoint is supplied it is always honoured (the caller
+        # only supplies one for allowlist/open); never emit --network none.
+        from mcp_contract.proxy.plan import EgressPlan
+
+        plan = EgressPlan(mode="open", hosts=[])
+        args = translate_network_args(
+            plan, "http://host.docker.internal:1", ServerSpec(server_id="srv")
+        )
+        assert "--network" not in args
+        assert "--add-host=host.docker.internal:host-gateway" in args
+
+
+# ---------------------------------------------------------------------------
 # /proc/net/tcp parsing (pure, no docker needed)
 # ---------------------------------------------------------------------------
 
@@ -353,6 +421,139 @@ class TestProcNetTcpParsing:
 
 
 # ---------------------------------------------------------------------------
+# /proc/net/route default-gateway parsing (pure, no docker needed)
+# ---------------------------------------------------------------------------
+
+
+class TestParseDefaultGateway:
+    def test_default_route_gateway_decoded_little_endian(self) -> None:
+        # Destination 00000000 marks the default route; Gateway 010011AC is the
+        # little-endian hex for the docker bridge gateway 172.17.0.1.
+        text = (
+            "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\t"
+            "Mask\tMTU\tWindow\tIRTT\n"
+            "eth0\t00000000\t010011AC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n"
+            "eth0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n"
+        )
+        assert parse_default_gateway(text) == "172.17.0.1"
+
+    def test_no_default_route_returns_none(self) -> None:
+        text = (
+            "Iface\tDestination\tGateway\tFlags\n"
+            "eth0\t000011AC\t00000000\t0001\n"  # on-link only, no default route
+        )
+        assert parse_default_gateway(text) is None
+
+    def test_garbage_and_empty_return_none(self) -> None:
+        assert parse_default_gateway("") is None
+        assert parse_default_gateway("cat: /proc/net/route: No such file\n") is None
+
+
+# ---------------------------------------------------------------------------
+# event_stream: the sanctioned container->gateway->proxy hop is suppressed by
+# the IP-level poller, while a genuine raw-IP connection that bypasses the
+# proxy still surfaces as a net.connect drift signal.
+# ---------------------------------------------------------------------------
+
+
+class _FakeProxy:
+    def __init__(self, port: int) -> None:
+        self.port = port
+        self.stopped = False
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+class TestEventStreamProxyHopSuppression:
+    # Gateway 172.17.0.1 (010011AC) : proxy port 40000 (0x9C40) is the
+    # sanctioned hop; 8.8.8.8:443 (08080808:01BB) is a raw-IP bypass.
+    _ROUTE = (
+        "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\t"
+        "Mask\tMTU\tWindow\tIRTT\n"
+        "eth0\t00000000\t010011AC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n"
+    )
+    _TCP = (
+        "  sl  local_address rem_address   st junk\n"
+        "   0: 0100000A:C000 010011AC:9C40 01 0\n"  # gateway:proxy_port
+        "   1: 0100000A:C001 08080808:01BB 01 0\n"  # 8.8.8.8:443 (bypass)
+    )
+
+    def _handle(self, port: int):
+        import queue
+
+        from mcp_contract.ral.base import ServerHandle
+
+        channel = _ProxyChannel(proxy=_FakeProxy(port), events=queue.Queue())
+        handle = ServerHandle(
+            id="c1", backend="docker", spec=ServerSpec(server_id="s"), native=channel
+        )
+        return handle, channel
+
+    def _make_run(self, route_rc: int):
+        polls = {"n": 0}
+
+        def run(args, env=None):
+            cmd = args[0]
+            if cmd == "inspect":
+                polls["n"] += 1
+                # running for the first poll, exited afterwards -> loop ends.
+                return self._result(0, "true\n" if polls["n"] == 1 else "false\n")
+            if cmd == "exec":
+                if "/proc/net/route" in args:
+                    return self._result(route_rc, self._ROUTE if route_rc == 0 else "")
+                if "/proc/net/tcp" in args:
+                    return self._result(0, self._TCP)
+                return self._result(0, "")
+            if cmd == "top":
+                return self._result(0, "PID   COMM\n")  # no procs
+            return self._result(0, "")
+
+        return run
+
+    @staticmethod
+    def _result(returncode: int, stdout: str = "", stderr: str = ""):
+        import subprocess
+
+        return subprocess.CompletedProcess(
+            args=["docker"], returncode=returncode, stdout=stdout, stderr=stderr
+        )
+
+    def test_gateway_hop_suppressed_raw_ip_bypass_emitted(self, monkeypatch) -> None:
+        adapter = DockerAdapter(poll_interval=0.01, egress_proxy=True)
+        handle, channel = self._handle(40000)
+        monkeypatch.setattr(adapter, "_run", self._make_run(route_rc=0))
+
+        events = list(adapter.event_stream(handle))
+        ips = [
+            (e.detail["ip"], e.detail["port"])
+            for e in events
+            if e.kind == EventKind.NET_CONNECT
+        ]
+        assert channel.gateway_ip == "172.17.0.1"  # resolved once
+        assert ("8.8.8.8", 443) in ips  # raw-IP bypass still surfaces as drift
+        assert ("172.17.0.1", 40000) not in ips  # sanctioned proxy hop dropped
+        assert channel.proxy.stopped is True  # proxy stopped on container exit
+
+    def test_port_only_fallback_when_gateway_unresolvable(self, monkeypatch) -> None:
+        # If the gateway can't be resolved (route exec fails), suppress the hop
+        # by proxy port alone so a clean proxied run is never falsely flagged.
+        adapter = DockerAdapter(poll_interval=0.01, egress_proxy=True)
+        handle, channel = self._handle(40000)
+        monkeypatch.setattr(adapter, "_run", self._make_run(route_rc=1))
+
+        events = list(adapter.event_stream(handle))
+        ips = [
+            (e.detail["ip"], e.detail["port"])
+            for e in events
+            if e.kind == EventKind.NET_CONNECT
+        ]
+        assert channel.gateway_ip is None  # resolution failed
+        assert ("172.17.0.1", 40000) not in ips  # still suppressed (port-only)
+        assert ("8.8.8.8", 443) in ips  # different port -> still surfaces
+
+
+# ---------------------------------------------------------------------------
 # docker top parsing (pure, no docker needed)
 # ---------------------------------------------------------------------------
 
@@ -399,6 +600,22 @@ class TestDockerAdapterUnit:
         assert caps.syscall == SupportLevel.NONE
         assert caps.boot_time_policy is True
         assert caps.runtime_block is True  # docker kill, coarse
+
+    def test_egress_proxy_promotes_network_to_enforce(self) -> None:
+        # With the egress proxy wired, the network axis becomes ENFORCE (the
+        # proxy applies the allowlist deny-by-default); the default stays
+        # OBSERVE. Other axes are unaffected.
+        assert DockerAdapter().egress_proxy is False
+        enforcing = DockerAdapter(egress_proxy=True)
+        assert enforcing.egress_proxy is True
+        assert enforcing.capabilities().network == SupportLevel.ENFORCE
+        assert DockerAdapter().capabilities().network == SupportLevel.OBSERVE
+        assert enforcing.capabilities().filesystem == SupportLevel.ENFORCE
+
+    def test_get_adapter_docker_egress_proxy_kwarg(self) -> None:
+        adapter = get_adapter("docker", egress_proxy=True)
+        assert isinstance(adapter, DockerAdapter)
+        assert adapter.egress_proxy is True
 
     def test_start_requires_image(self) -> None:
         with pytest.raises(ValueError, match="image"):
@@ -521,3 +738,47 @@ def test_docker_adapter_integration_observe_loop() -> None:
     assert all(e.backend == "docker" for e in events)
     # --network none: the polling loop must not report any egress
     assert not [e for e in events if e.kind == EventKind.NET_CONNECT]
+
+
+@pytest.mark.skipif(
+    shutil.which("docker") is None
+    or os.environ.get("MCP_CONTRACT_DOCKER_TESTS") != "1",
+    reason="needs the docker binary and MCP_CONTRACT_DOCKER_TESTS=1",
+)
+def test_docker_adapter_integration_egress_proxy_wiring() -> None:
+    """Boot a real container with egress_proxy=True and confirm the wiring.
+
+    Verifies an EgressProxy is started on the host and the container actually
+    received `HTTP_PROXY=http://host.docker.internal:<port>` (checked via
+    `docker exec printenv`, not by making the container egress — no real
+    network is touched). The proxy is torn down cleanly by stop().
+    """
+    import subprocess
+
+    from mcp_contract.ral.docker import _ProxyChannel
+
+    adapter = DockerAdapter(poll_interval=0.5, egress_proxy=True)
+    # Granting net.http -> plan.mode == "allowlist" -> a proxy is started.
+    policy = _policy(_cap(CapabilityId.NET_HTTP, values=["api.github.com"]))
+    spec = ServerSpec(
+        server_id="it-proxy", image="alpine:3.20", command=["sleep", "6"]
+    )
+    handle = adapter.start(spec, policy)
+    try:
+        assert isinstance(handle.native, _ProxyChannel)
+        proxy = handle.native.proxy
+        assert proxy.port > 0
+        res = subprocess.run(
+            ["docker", "exec", handle.id, "printenv", "HTTP_PROXY"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert res.returncode == 0, res.stderr
+        assert "host.docker.internal" in res.stdout
+        assert f":{proxy.port}" in res.stdout
+        events = list(adapter.event_stream(handle))  # ends when sleep exits
+    finally:
+        adapter.stop(handle)
+    # stop() (and event_stream's exit) shut the proxy down idempotently.
+    assert all(e.backend is not None for e in events)

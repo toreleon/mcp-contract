@@ -8,6 +8,8 @@ Subcommands:
           outside_contract event, 4 when the input is missing/corrupt or
           zero events were observed (inconclusive, never a security
           signal; --allow-empty accepts an empty stream), 0 clean
+  proxy   run the enforcing egress proxy standalone (deny-by-default,
+          hostname-level net.http enforcement; every attempt logged)
 
 Conventions: human-facing chatter goes to stderr; machine output (YAML/JSON)
 goes to stdout. PIE/BCM/policy modules are imported inside the subcommand
@@ -18,11 +20,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
+import threading
 from pathlib import Path
-from typing import TextIO
+from typing import Callable, TextIO
 
 from mcp_contract.models import (
+    BehaviorEvent,
     CapabilityId,
     CapabilityStatus,
     Mode,
@@ -46,6 +51,30 @@ EXIT_NO_EVENTS = 4      # verify: zero events observed (inconclusive, not clean)
 def _say(message: str) -> None:
     """Human-facing chatter; never mixed into machine output."""
     print(message, file=sys.stderr)
+
+
+# Test seam for the `proxy` subcommand. When set, it is called with the bound
+# EgressProxy right after start-up and is expected to drive traffic and then
+# return, at which point the proxy is torn down. This lets tests exercise the
+# standalone proxy in-process, on an ephemeral port, without real SIGINT
+# delivery (which only reaches the main thread). Production leaves it None and
+# blocks in `_wait_for_sigint`.
+_PROXY_SERVE_HOOK: Callable[[object], None] | None = None
+
+
+def _wait_for_sigint() -> None:
+    """Block until SIGINT (Ctrl-C), then return so the caller can shut down."""
+    stop = threading.Event()
+    try:
+        signal.signal(signal.SIGINT, lambda *_: stop.set())
+    except ValueError:
+        # Signal handlers install only on the main thread; when the proxy is
+        # driven from a worker thread the caller uses the serve hook instead.
+        pass
+    try:
+        stop.wait()
+    except KeyboardInterrupt:  # pragma: no cover - defensive
+        pass
 
 
 def _print_report_summary(report: ViolationReport, stream: TextIO) -> None:
@@ -118,6 +147,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
     policy = load_policy(Path(args.policy))
 
     if args.backend == "mock":
+        if args.egress_proxy:
+            _say(
+                "note: --egress-proxy has no effect with --backend mock "
+                "(mock replays recorded events); ignoring"
+            )
         if not args.events_in:
             _say("error: --backend mock replays a recorded stream; pass --events-in FILE")
             return EXIT_USAGE
@@ -126,7 +160,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
         if not args.image:
             _say("error: --backend docker requires --image")
             return EXIT_USAGE
-        adapter = get_adapter("docker")
+        # egress_proxy=True makes the docker adapter route the container's
+        # egress through an EgressProxy for hostname-level net.http ENFORCE.
+        adapter = get_adapter("docker", egress_proxy=args.egress_proxy)
 
     # Only granted env values are forwarded from the host environment; the
     # adapter filters again on its side (defense in depth).
@@ -230,6 +266,84 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _cmd_proxy(args: argparse.Namespace) -> int:
+    """Run the enforcing egress proxy standalone (backend-agnostic).
+
+    Point any MCP server or client at it via HTTP_PROXY/HTTPS_PROXY. The
+    allowlist comes from `--allow HOST ...` or, with `--policy FILE`, from the
+    policy's granted `net.http` (`egress_plan`, deny-by-default). Every
+    connection attempt — allowed or denied — is emitted as one JSON line to
+    stdout and appended to `--events-out` when given. Runs until SIGINT and
+    exits 0 on a clean shutdown; a denied host is 403'd and never dialled
+    upstream.
+    """
+    from mcp_contract.proxy.plan import egress_plan
+    from mcp_contract.proxy.server import EgressProxy
+
+    if args.allow and args.policy:
+        _say("error: pass either --allow or --policy, not both")
+        return EXIT_USAGE
+
+    allow: object
+    if args.policy:
+        # Path() so a mistyped --policy fails as "file not found" rather than
+        # being reinterpreted as inline YAML text (load_policy's str form).
+        from mcp_contract.policy import load_policy
+
+        plan = egress_plan(load_policy(Path(args.policy)))
+        allow = plan
+        hosts = ", ".join(plan.hosts) if plan.hosts else "(none)"
+        _say(f"egress plan from {args.policy}: mode={plan.mode} hosts={hosts}")
+    elif args.allow:
+        allow = list(args.allow)  # bare list => allowlist (deny-by-default)
+        _say("egress allowlist: " + ", ".join(allow))
+    else:
+        # Deny-by-default: no allowlist means block (and observe) all egress.
+        allow = []
+        _say("no --allow/--policy given: denying all egress (deny-by-default)")
+
+    # Append mode: an --events-out log accumulates across proxy runs and is
+    # never clobbered (it may be a standing audit trail).
+    events_file = (
+        open(args.events_out, "a", encoding="utf-8") if args.events_out else None
+    )
+
+    def _on_event(event: BehaviorEvent) -> None:
+        # Called synchronously under the proxy's lock, so lines from
+        # concurrent tunnels never interleave.
+        line = json.dumps(event.to_dict(), sort_keys=True)
+        print(line, file=sys.stdout, flush=True)
+        if events_file is not None:
+            events_file.write(line + "\n")
+            events_file.flush()
+
+    attempts: list[BehaviorEvent] = []
+    try:
+        with EgressProxy(
+            allow, on_event=_on_event, host=args.host, port=args.port
+        ) as proxy:
+            _say(
+                f"egress proxy listening on {proxy.address[0]}:{proxy.port} "
+                "(Ctrl-C to stop)"
+            )
+            hook = _PROXY_SERVE_HOOK
+            if hook is not None:
+                hook(proxy)  # test seam: drive clients in-process, then return
+            else:
+                _wait_for_sigint()
+            attempts = list(proxy.events)
+    finally:
+        if events_file is not None:
+            events_file.close()
+
+    allowed = sum(1 for e in attempts if e.detail.get("allowed"))
+    _say(
+        f"egress proxy stopped: {len(attempts)} connection attempt(s), "
+        f"{allowed} allowed, {len(attempts) - allowed} denied"
+    )
+    return EXIT_OK
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Assemble the argparse tree for all four subcommands."""
     parser = argparse.ArgumentParser(
@@ -272,6 +386,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="proceed even if the manifest hash no longer matches the policy",
     )
+    p.add_argument(
+        "--egress-proxy",
+        action="store_true",
+        help="(docker backend) enforce hostname-level net.http by routing "
+        "container egress through an egress proxy; no effect with --backend mock",
+    )
     p.set_defaults(func=_cmd_run)
 
     p = sub.add_parser("audit", help="classify a recorded event stream offline")
@@ -299,6 +419,43 @@ def _build_parser() -> argparse.ArgumentParser:
         "inconclusive (exit 4)",
     )
     p.set_defaults(func=_cmd_verify)
+
+    p = sub.add_parser(
+        "proxy",
+        help="run the enforcing egress proxy standalone (deny-by-default)",
+        description=(
+            "Run the hostname-level egress proxy standalone and point any MCP "
+            "server or client at it (HTTP_PROXY/HTTPS_PROXY). Denies by "
+            "default; allowed and denied attempts are logged as JSONL to "
+            "stdout. Runs until Ctrl-C."
+        ),
+    )
+    p.add_argument(
+        "--allow",
+        nargs="*",
+        default=None,
+        metavar="HOST",
+        help="allowlisted hostnames/patterns (exact, '*', or '*.example.com'); "
+        "omit both --allow and --policy to deny all egress",
+    )
+    p.add_argument(
+        "--policy",
+        default=None,
+        help="derive the allowlist from a policy YAML's granted net.http "
+        "(egress_plan); mutually exclusive with --allow",
+    )
+    p.add_argument(
+        "--host", default="127.0.0.1", help="bind address (default 127.0.0.1)"
+    )
+    p.add_argument(
+        "--port", type=int, default=0, help="bind port (default 0 = ephemeral)"
+    )
+    p.add_argument(
+        "--events-out",
+        default=None,
+        help="also write each connection event as one JSON line to FILE",
+    )
+    p.set_defaults(func=_cmd_proxy)
 
     return parser
 

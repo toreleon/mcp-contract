@@ -72,20 +72,73 @@ a CI-gate sketch lives in [examples/github-action.yml](examples/github-action.ym
 | Command | What it does | Exit codes |
 |---|---|---|
 | `infer MANIFEST [-o FILE] [--json]` | manifest → policy YAML; `needs_review` summary on stderr | 0 |
-| `run MANIFEST --policy P --backend {docker,mock} --mode {observe,alert,enforce}` | start (or replay) the server, monitor live, optionally write events/report | 0 ok/warning, 1 critical, 3 manifest drift, 4 missing/corrupt input |
+| `run MANIFEST --policy P --backend {docker,mock} --mode {observe,alert,enforce} [--egress-proxy]` | start (or replay) the server, monitor live, optionally write events/report; `--egress-proxy` (docker only) turns on hostname-level network **enforcement** | 0 ok/warning, 1 critical, 3 manifest drift, 4 missing/corrupt input |
 | `audit --events E --policy P --manifest M [--json]` | offline classification report | 0 (it reports, it never gates); 4 missing/corrupt input |
 | `verify MANIFEST --policy P --events E [--allow-empty]` | the CI gate | 0 clean, 1 outside-contract event, 2 manifest hash mismatch (rug-pull), 4 inconclusive (missing/corrupt input, or zero events observed — never a security signal) |
+| `proxy [--allow HOST ...] [--policy P] [--host H] [--port N] [--events-out FILE]` | run the enforcing egress proxy standalone (deny-by-default); logs every allowed/denied attempt as JSONL to stdout; runs until Ctrl-C | 0 clean shutdown |
 
 Machine output (YAML/JSON) goes to stdout, human chatter to stderr.
+
+## Network enforcement: the egress proxy
+
+`net.http` is the one capability whose *values* are hostnames, but the docker
+backend only ever sees raw IPs: it discovers connections by polling
+`/proc/net/tcp` inside the container, so a policy that grants
+`net.http: [api.github.com]` can never be matched against — let alone
+enforced on — an observed connection. That is the "docker sees IPs, not
+hostnames" gap.
+
+The **egress proxy** closes it. Sanctioned egress is routed *through* a small
+stdlib proxy (`mcp_contract.proxy.EgressProxy`) that resolves the hostname
+from the `CONNECT` target (or the request URL), checks it against the
+allowlist with the **same** `host_matches` rule BCM uses, and:
+
+- **allows** → opens the upstream socket, relays bytes, and emits a
+  `net.connect` event carrying `detail["host"]` (`via: "proxy"`);
+- **denies** → replies `403 Forbidden` and **never opens the upstream
+  socket** (deny-by-default; a denied host never reaches the network).
+
+The allowlist is derived from the policy by `egress_plan`, deny-by-default:
+no `net.http` grant → deny all; `["*"]` → open (allow all, still logged);
+concrete hosts → allowlist; empty values → deny all (fail closed).
+
+```bash
+# Run the enforcing proxy standalone and point any MCP server/client at it:
+mcp-contract proxy --allow api.github.com --allow '*.githubusercontent.com'
+# … then in the server's environment:
+#   HTTPS_PROXY=http://127.0.0.1:<port> HTTP_PROXY=http://127.0.0.1:<port>
+
+# Or derive the allowlist straight from an approved policy:
+mcp-contract proxy --policy github.policy.yaml
+```
+
+A runnable, docker-free walkthrough (allowed host succeeds, denied host gets
+403, emitted events) is in
+[examples/egress-proxy-demo.sh](examples/egress-proxy-demo.sh).
+
+**Why it composes — two observation sources, one contract.** With the proxy in
+front, hostname-level egress is *enforced*, while the existing
+`/proc/net/tcp` poller keeps running. Any **direct** connection to a raw IP
+that bypassed the proxy (a server that ignores `HTTP_PROXY` and dials an IP
+itself) is exactly the drift the poller catches: it surfaces as an IP-valued
+`net.connect` that matches no granted host and lands in `outside_contract`.
+So in v0 the raw-IP bypass is **flagged, not blocked** — airtight blocking
+needs the internal-network + iptables follow-on (M-series). The proxy makes
+the common, well-behaved path enforceable; the poller makes the misbehaving
+path *visible*.
+
+Run it under docker with `mcp-contract run … --backend docker --egress-proxy`:
+the adapter starts the proxy, injects `HTTP(S)_PROXY` into the container, and
+drains the proxy's hostname-level events alongside the IP-level poller events.
 
 ## Honest status: v0 vs the roadmap
 
 | Milestone (SPEC §11) | v0 status |
 |---|---|
-| **M1** PIE + Docker adapter (observe) | **Partial.** Rule-based PIE only — no static analysis of server source; LLM-assist is a guarded protocol (`LLMAssist`) with a `NullLLM` default. Docker adapter observes by polling, not eBPF/proxy. |
+| **M1** PIE + Docker adapter (observe) | **Partial.** Rule-based PIE only — no static analysis of server source; LLM-assist is a guarded protocol (`LLMAssist`) with a `NullLLM` default. The docker adapter observes by polling (not eBPF); hostname-level network *enforcement* now ships via the egress proxy (`--egress-proxy`). |
 | **M2** BCM diffing + `verify` CI gate | **Shipped.** Three-bucket classification, `verify` exit codes, GitHub Action sketch, fixture-backed e2e tests. |
 | **M3** `policy-mcp` upstream PR + gVisor adapter | **Not started.** Upstream-PR material is collected in `docs/policy-mcp-notes.md`; no gVisor adapter yet. |
-| **M4** enforce mode + rug-pull detection | **Partial.** Rug-pull gate is real (`verify` exit 2, `ManifestDriftError` at monitor start). Enforce mode exists, but docker "block" is coarse: kill the container. |
+| **M4** enforce mode + rug-pull detection | **Partial.** Rug-pull gate is real (`verify` exit 2, `ManifestDriftError` at monitor start). Enforce mode exists; docker per-event "block" is coarse (kill the container), but hostname-level egress is enforced deny-by-default by the egress proxy (`--egress-proxy`). Raw-IP bypass is still only flagged, not blocked (needs internal-network + iptables). |
 | **M5** report/SIEM export + fleet API | **Partial.** Per-run JSON report export only; no fleet API. |
 | **M6** v1.0 + infra-team pilot | **Not started.** |
 
@@ -95,7 +148,7 @@ From the `BackendCaps` each adapter declares (`none` / `observe` / `enforce`):
 
 | Axis | mock | docker |
 |---|---|---|
-| network | enforce | observe [1] |
+| network | enforce | observe · **enforce** w/ `--egress-proxy` [1] |
 | filesystem | enforce | enforce [2] |
 | process | enforce | observe [3] |
 | syscall | enforce | none |
@@ -104,11 +157,19 @@ From the `BackendCaps` each adapter declares (`none` / `observe` / `enforce`):
 
 Known docker gaps in v0, on purpose and documented rather than papered over:
 
-1. **Network events are IPs, not hostnames.** Connections are discovered by
-   polling `/proc/net/tcp` inside the container, so events carry remote IPs;
-   hostname-level matching (and per-host egress *enforcement*) needs an
-   egress proxy, which v0 does not ship. `--network none` is applied at boot
-   when the policy grants no `net.http` at all.
+1. **Network: IP-level observe by default, hostname-level enforce with
+   `--egress-proxy`.** Without the proxy, connections are discovered by
+   polling `/proc/net/tcp` inside the container, so events carry remote IPs
+   and per-host egress is only *observed*; `--network none` is applied at
+   boot when the policy grants no `net.http` at all. With `--egress-proxy`
+   (see [Network enforcement](#network-enforcement-the-egress-proxy)) the
+   container's egress is routed through the proxy, which enforces the
+   allowlist by hostname (deny-by-default, 403 on miss) and emits
+   hostname-level `net.connect` events. Residual v0 limitation: a server that
+   ignores `HTTP_PROXY` and dials a raw IP directly is **not blocked**, but
+   the `/proc/net/tcp` poller still observes the connection and BCM flags it
+   `outside_contract` — airtight blocking needs the internal-network +
+   iptables follow-on.
 2. **No per-open filesystem events.** Filesystem scope is enforced at boot
    via ro/rw bind mounts derived from granted `fs.read`/`fs.write` values;
    docker emits no per-open events, so runtime fs activity is invisible to
