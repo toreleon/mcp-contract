@@ -13,7 +13,9 @@ keywords = ["mcp", "sandbox", "security", "least-privilege", "policy"]
 dependencies = ["PyYAML>=6.0"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+# jsonschema is a DEV-ONLY belt-and-suspenders cross-check for the policy-mcp
+# conformance tests (GO-FORWARD-0.1.0 §8); runtime deps stay stdlib + PyYAML.
+dev = ["pytest>=8.0", "jsonschema>=4.0"]
 
 [project.scripts]
 mcp-contract = "mcp_contract.cli:main"
