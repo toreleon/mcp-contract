@@ -1,0 +1,65 @@
+# Sketch of the CI gate from SPEC.md §8.2: block a merge when the MCP
+# server's observed behavior leaves its declared contract.
+#
+# Adjust the manifest/policy paths and the image to your repository. The
+# policy is generated once with `mcp-contract infer`, hand-approved
+# (needs_review -> inferred), and committed; CI then replays the server's
+# behavior against it on every pull request.
+name: mcp-contract verify
+
+on:
+  pull_request:
+    paths:
+      - "server/**"
+      - "manifests/**"
+      - "policies/**"
+
+jobs:
+  contract-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install mcp-contract
+        run: pip install mcp-contract  # or: pip install -e .
+
+      - name: Observe the server while the test-suite drives it
+        # Docker backend gaps in v0 (see README): network events are IPs
+        # from /proc/net/tcp polling (hostname matching needs an egress
+        # proxy) and there are no per-open fs events (fs scope is enforced
+        # at boot via mounts instead).
+        run: |
+          mcp-contract run manifests/my-server.json \
+            --policy policies/my-server.policy.yaml \
+            --backend docker --mode observe \
+            --image ghcr.io/acme/my-mcp-server:pr-${{ github.event.number }} \
+            --duration 120 \
+            --events-out behavior.jsonl \
+            --report-out observe-report.json
+
+      - name: Verify recorded behavior against the declared contract
+        # Exit codes:
+        #   0 - clean, merge may proceed
+        #   1 - behavior outside the declared contract -> block the merge
+        #   2 - manifest changed since the policy was generated (rug-pull)
+        #       -> re-run `mcp-contract infer` and re-approve the policy
+        #   4 - inconclusive: input file missing/corrupt, or zero events
+        #       observed (monitoring harness failure?) -> fix the pipeline;
+        #       never treat as a rug-pull or a violation
+        run: |
+          mcp-contract verify manifests/my-server.json \
+            --policy policies/my-server.policy.yaml \
+            --events behavior.jsonl
+
+      - name: Upload behavior artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-contract-behavior
+          path: |
+            behavior.jsonl
+            observe-report.json

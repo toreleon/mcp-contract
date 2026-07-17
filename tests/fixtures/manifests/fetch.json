@@ -1,0 +1,22 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "tools": [
+      {
+        "name": "fetch",
+        "description": "Fetch a URL from the internet and extract its contents as markdown.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "url": {"type": "string", "format": "uri", "description": "URL to fetch"},
+            "max_length": {"type": "integer", "description": "Maximum number of characters to return", "default": 5000},
+            "start_index": {"type": "integer", "description": "Start content from this character index (for pagination)", "default": 0},
+            "raw": {"type": "boolean", "description": "Return raw HTML instead of markdown", "default": false}
+          },
+          "required": ["url"]
+        }
+      }
+    ]
+  }
+}

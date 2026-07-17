@@ -1,0 +1,28 @@
+{
+  "name": "shell",
+  "tools": [
+    {
+      "name": "run_command",
+      "description": "Run a shell command on the host and return its stdout, stderr, and exit code.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "command": {"type": "string", "description": "The shell command line to execute"},
+          "cwd": {"type": "string", "description": "Working directory for the command"},
+          "timeout_ms": {"type": "integer", "description": "Kill the command after this many milliseconds", "default": 30000}
+        },
+        "required": ["command"]
+      }
+    },
+    {
+      "name": "list_processes",
+      "description": "List currently running processes with their pid, owner, and memory usage.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "limit": {"type": "integer", "description": "Maximum number of entries to return", "default": 50}
+        }
+      }
+    }
+  ]
+}

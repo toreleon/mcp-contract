@@ -1,0 +1,39 @@
+{
+  "name": "slack",
+  "tools": [
+    {
+      "name": "post_message",
+      "description": "Post a message to a Slack channel via the Slack Web API (https://slack.com/api). Authenticates with the SLACK_BOT_TOKEN environment variable.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "channel_id": {"type": "string", "description": "ID of the channel to post in"},
+          "text": {"type": "string", "description": "Message text in Slack mrkdwn"}
+        },
+        "required": ["channel_id", "text"]
+      }
+    },
+    {
+      "name": "list_channels",
+      "description": "List public channels in the workspace via the Slack Web API at https://slack.com/api.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "limit": {"type": "integer", "description": "Maximum number of channels to return", "default": 100},
+          "cursor": {"type": "string", "description": "Pagination cursor from a previous call"}
+        }
+      }
+    },
+    {
+      "name": "get_users",
+      "description": "Fetch the members of the Slack workspace from the Slack Web API at https://slack.com/api.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "limit": {"type": "integer", "description": "Maximum number of users to return", "default": 200},
+          "cursor": {"type": "string", "description": "Pagination cursor from a previous call"}
+        }
+      }
+    }
+  ]
+}
