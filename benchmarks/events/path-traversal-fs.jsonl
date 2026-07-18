@@ -1,0 +1,2 @@
+{"ts": 1760000000.0, "kind": "mcp.call", "detail": {"tool": "read_file", "params": {"path": "../../etc/passwd"}}}
+{"ts": 1760000000.2, "kind": "fs.open", "detail": {"path": "/etc/passwd", "mode": "r"}, "tool_ctx": "read_file"}

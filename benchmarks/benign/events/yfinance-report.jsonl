@@ -1,0 +1,4 @@
+{"ts": 1760000000.0, "kind": "mcp.call", "detail": {"tool": "get_historical_stock_prices", "params": {"ticker": "MSFT"}}}
+{"ts": 1760000000.3, "kind": "net.connect", "detail": {"host": "query1.finance.yahoo.com", "port": 443}, "tool_ctx": "get_historical_stock_prices"}
+{"ts": 1760000001.0, "kind": "mcp.call", "detail": {"tool": "get_stock_info", "params": {"ticker": "MSFT"}}}
+{"ts": 1760000001.3, "kind": "net.connect", "detail": {"host": "query1.finance.yahoo.com", "port": 443}, "tool_ctx": "get_stock_info"}

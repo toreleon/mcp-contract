@@ -1,0 +1,130 @@
+# Phase-1 detection matrix for mcp-contract.
+#
+# Each case is a (manifest, approved-policy, event-trace) triplet fed to the
+# SHIPPED `mcp-contract verify` gate. `run.py` regenerates the approved policy
+# from the manifest + `approve:` block (so the manifest hash always matches,
+# except deliberately for rug-pull), runs verify, and scores the real exit code
+# against `expect_exit`.
+#
+# partitions (see README):
+#   in-scope        -> capability CLASS never declared; MUST hard-fail (exit 1)
+#   manifest-tamper -> manifest changed after approval; MUST hard-fail (exit 2)
+#   soft            -> class declared but scope violated; verify PASSES (exit 0)
+#                      by design and surfaces within_manifest_not_policy instead;
+#                      net-scope is hard-enforced by the egress proxy (Phase 2)
+#   out-of-scope    -> pure agent-reasoning attack, resulting action stays in
+#                      contract; verify MUST NOT fire (exit 0) — correct silence
+#   benign          -> normal workflow; false-positive check (exit 0)
+#
+# approve: maps a capability id -> granted values; run.py flips that cap to
+# status=inferred with those values. Caps omitted here keep the PIE default
+# (denied, or needs_review = not granted).
+
+cases:
+  # ---- in-scope: undeclared capability class -> outside_contract, exit 1 ----
+  - id: exfil-arith
+    source: "MCPSecBench: Data Exfiltration"
+    partition: in-scope
+    manifest: arith.json
+    approve: {}
+    events: exfil-arith.jsonl
+    expect_exit: 1
+    note: "arithmetic server opens a socket to an attacker host"
+
+  - id: sandbox-escape-arith
+    source: "MCPSecBench: Sandbox Escape"
+    partition: in-scope
+    manifest: arith.json
+    approve: {}
+    events: sandbox-escape-arith.jsonl
+    expect_exit: 1
+    note: "arithmetic server spawns a shell command (echo 'hacked' > hacked)"
+
+  - id: read-files-arith
+    source: "MCPSecBench: get_and_read_all_files / Tool Misuse"
+    partition: in-scope
+    manifest: arith.json
+    approve: {}
+    events: read-files-arith.jsonl
+    expect_exit: 1
+    note: "arithmetic server reads an arbitrary file it never declared"
+
+  - id: ssh-key-fetch
+    source: "MCPTox P2: implicit-trigger function hijacking (read SSH key)"
+    partition: in-scope
+    manifest: fetch.json
+    approve:
+      net.http: ["*"]
+    events: ssh-key-fetch.jsonl
+    expect_exit: 1
+    note: "net-only fetch server reads ~/.ssh/id_rsa; fs.read never declared"
+
+  - id: env-exfil-fs
+    source: "MCPTox: Privacy Leakage (environment secret)"
+    partition: in-scope
+    manifest: filesystem.json
+    approve:
+      fs.read: ["/data"]
+      fs.write: ["/data"]
+    events: env-exfil-fs.jsonl
+    expect_exit: 1
+    note: "filesystem server reads AWS_SECRET_ACCESS_KEY; env never declared"
+
+  # ---- manifest-tamper: rug-pull -> hash mismatch, exit 2 ----
+  - id: rug-pull
+    source: "MCPSecBench: Rug Pull"
+    partition: manifest-tamper
+    manifest: filesystem.json          # policy is approved against this
+    verify_manifest: filesystem-tampered.json  # server now ships a run_command tool
+    approve:
+      fs.read: ["/data"]
+      fs.write: ["/data"]
+    events: rug-pull.jsonl
+    expect_exit: 2
+    note: "manifest gained a tool after approval; behavior itself is benign"
+
+  # ---- soft: declared class, scope violated -> within_manifest_not_policy, exit 0 ----
+  - id: path-traversal-fs
+    source: "MCPSecBench: Vulnerable Server (path traversal)"
+    partition: soft
+    manifest: filesystem.json
+    approve:
+      fs.read: ["/data"]
+      fs.write: ["/data"]
+    events: path-traversal-fs.jsonl
+    expect_exit: 0
+    note: "fs server reads /etc/passwd; fs.read IS declared, so this is a SOFT flag, not a gate failure. Tighten the policy or enable per-open fs enforcement to harden."
+
+  - id: mitm-fetch
+    source: "MCPSecBench: MITM / egress redirect"
+    partition: soft
+    manifest: fetch.json
+    approve:
+      net.http: ["api.github.com"]
+    events: mitm-fetch.jsonl
+    expect_exit: 0
+    note: "fetch server dials the wrong host; net.http class IS declared, so verify only soft-flags it. The egress proxy (Phase 2, --egress-proxy) hard-blocks this deny-by-default."
+
+  # ---- out-of-scope: reasoning attack, action stays in contract -> exit 0 ----
+  - id: confused-ai-inscope
+    source: "MCPSecBench: Tool Misuse via Confused AI (in-contract action)"
+    partition: out-of-scope
+    manifest: filesystem.json
+    approve:
+      fs.read: ["/data"]
+      fs.write: ["/data"]
+    events: confused-ai-inscope.jsonl
+    expect_exit: 0
+    note: "agent is manipulated but only reads /data/notes.txt (in scope). Correct silence: mcp-contract is a contract monitor, not a prompt-injection detector."
+
+  # ---- benign: false-positive check -> exit 0 ----
+  - id: benign-clean
+    source: "baseline"
+    partition: benign
+    manifest: filesystem.json
+    approve:
+      fs.read: ["/data"]
+      fs.write: ["/data"]
+    events: benign-clean.jsonl
+    expect_exit: 0
+    note: "normal read/list/write workflow entirely within /data"

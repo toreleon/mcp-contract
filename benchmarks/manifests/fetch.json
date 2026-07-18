@@ -1,0 +1,17 @@
+{
+  "tools": [
+    {
+      "name": "fetch",
+      "description": "Fetch a URL from the internet and extract its contents as markdown.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "url": {"type": "string", "format": "uri", "description": "URL to fetch"},
+          "max_length": {"type": "integer", "description": "Maximum number of characters to return", "default": 5000},
+          "raw": {"type": "boolean", "description": "Return raw HTML instead of markdown", "default": false}
+        },
+        "required": ["url"]
+      }
+    }
+  ]
+}

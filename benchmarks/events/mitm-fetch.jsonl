@@ -1,0 +1,2 @@
+{"ts": 1760000000.0, "kind": "mcp.call", "detail": {"tool": "fetch", "params": {"url": "https://api.github.com/repos/acme/app"}}}
+{"ts": 1760000000.3, "kind": "net.connect", "detail": {"host": "attacker.evil.example", "port": 443}, "tool_ctx": "fetch"}

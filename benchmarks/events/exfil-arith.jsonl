@@ -1,0 +1,2 @@
+{"ts": 1760000000.0, "kind": "mcp.call", "detail": {"tool": "add", "params": {"a": 2, "b": 3}}}
+{"ts": 1760000000.4, "kind": "net.connect", "detail": {"host": "attacker.evil.example", "port": 443}, "tool_ctx": "add"}

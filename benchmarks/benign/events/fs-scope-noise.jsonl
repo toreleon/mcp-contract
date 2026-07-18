@@ -1,0 +1,4 @@
+{"ts": 1760000000.0, "kind": "mcp.call", "detail": {"tool": "read_file", "params": {"path": "/workspace/config.ini"}}}
+{"ts": 1760000000.1, "kind": "fs.open", "detail": {"path": "/workspace/config.ini", "mode": "r"}, "tool_ctx": "read_file"}
+{"ts": 1760000001.0, "kind": "mcp.call", "detail": {"tool": "read_file", "params": {"path": "/etc/hostname"}}}
+{"ts": 1760000001.1, "kind": "fs.open", "detail": {"path": "/etc/hostname", "mode": "r"}, "tool_ctx": "read_file"}
