@@ -1,12 +1,14 @@
 # mcp-contract benchmarks
 
-Two runnable benchmarks against public MCP-attack scenarios:
+Three runnable benchmarks against public MCP-attack scenarios:
 
 - **Phase 1** — a labelled, reproducible detection matrix through the shipped
   `mcp-contract verify` gate. **No Docker, no LLM, no network.**
 - **Phase 2** — real Docker containers through `mcp-contract run --backend
   docker --egress-proxy`, asserting on the events the adapter actually
   observed/enforced. **Docker required, no LLM.**
+- **Phase 3** — a static PIE coverage baseline on real MCP servers plus a
+  tool-poisoning tripwire measured on the real MCPTox corpus. **Offline.**
 
 ```bash
 pip install -e ".[dev]"
@@ -17,6 +19,10 @@ python benchmarks/run.py --json   # also writes benchmarks/results.json
 
 # Phase 2: real containers + real network enforcement
 MCP_CONTRACT_DOCKER_TESTS=1 python benchmarks/run_docker.py
+
+# Phase 3: PIE coverage + tool-poisoning tripwire
+bash benchmarks/fetch_mcptox.sh   # optional: pull the real 485-case MCPTox corpus
+python benchmarks/run_pie.py      # falls back to a synthetic sample if not fetched
 ```
 
 ## Phase 1 — deterministic detection matrix
@@ -78,6 +84,10 @@ benchmarks/
   docker/
     Dockerfile.probe   # tiny alpine+curl "server" image
     scenarios/*.sh     # in-container behaviors (egress attempts)
+  run_pie.py        # Phase 3: PIE coverage + poisoning tripwire
+  poison_samples.jsonl  # committed synthetic poisoned tools (offline fallback)
+  fetch_mcptox.sh   # pull the real MCPTox corpus into data/ (git-ignored)
+  data/             # downloaded corpora (git-ignored, not vendored)
 ```
 
 Each case in `cases.yaml` names a `manifest`, an `approve:` block (which caps a
@@ -140,12 +150,45 @@ filesystem scope at boot via ro/rw bind mounts and emits no per-open events, so
 the Phase 1 fs cases (path traversal, SSH-key read) have no runtime signal on
 this backend — they stay in Phase 1.
 
-## Extending further (Phases 3–4)
+## Phase 3 — PIE coverage + tool-poisoning tripwire (static, offline)
 
-- **Phase 3 — PIE on real manifests + poisoning-diff.** Harvest MCPTox's 45
-  real servers / 353 tools, run `mcp-contract fleet infer` for a PIE
-  coverage/`needs_review` baseline, then diff the policy inferred from a clean
-  vs. a poisoned tool description as a poisoning tripwire.
+`run_pie.py` has two parts, both deterministic and offline.
+
+**Part A — PIE coverage on real servers.** Runs the shipped policy inference
+over the real public manifests vendored in `demo/artifacts/pub_*.json`
+(filesystem, fetch, memory, time, sequential-thinking, everything — 40 real
+tools). Every capability PIE infers on these real servers lands as
+`needs_review`, not `inferred`: the human-approval gate is on by default, so
+nothing is auto-granted (0 granted / 7 need review across 6 servers).
+
+**Part B — tool-poisoning tripwire.** For each MCPTox poisoned tool, infer a
+policy from the bare tool **name** vs. the name **plus the poisoned
+description**; any capability class the description *adds* is one the poisoning
+injected into an innocuous-looking tool. Measured on the **real MCPTox corpus**
+(485 poisoned tools, 45 servers; [arXiv:2508.14925](https://arxiv.org/abs/2508.14925)):
+
+| Metric | Value |
+|---|---|
+| tripwire fires (description injects ≥1 capability class) | **201 / 485 = 41.4%** |
+| injected capability breakdown | `net.http`×178, `proc.exec`×34, `env`×18 |
+| by attack paradigm | Template-1 ×22, Template-2 ×46, Template-3 ×133 |
+
+This is a **static** tripwire — it flags a poisoned description before the
+server ever runs, complementing the runtime monitor. It is honest about its
+reach: a payload that abuses **already-declared** tools (e.g. `write_file` to
+`~/.ssh/id_rsa` on a filesystem server) injects no new capability *class*, so it
+does not fire here — that residue is exactly the runtime arm's job (BCM scope
+check, the Phase 1 `soft` partition) and motivates the optional `LLMAssist`
+path for deeper static analysis.
+
+The real corpus is **not vendored** (third-party research data with
+realistic-looking secret payloads); `fetch_mcptox.sh` pulls it into
+`data/` (git-ignored). Without it, Part B runs on the committed synthetic
+sample `poison_samples.jsonl` (8 tools faithful to the MCPTox paradigms,
+including one benign control and one already-declared-tool-abuse miss).
+
+## Extending further (Phase 4)
+
 - **Phase 4 — breadth.** Point the Docker adapter at MCP-SafetyBench's
   `mcpuniverse` real servers ([2512.15163](https://arxiv.org/abs/2512.15163))
   to measure false-positive rate on benign multi-step, multi-server workflows.

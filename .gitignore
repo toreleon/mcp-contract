@@ -9,3 +9,4 @@ build/
 demo/artifacts/
 benchmarks/policies/
 benchmarks/results.json
+benchmarks/data/
