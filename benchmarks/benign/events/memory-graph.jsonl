@@ -1,0 +1,4 @@
+{"ts": 1760000000.0, "kind": "mcp.call", "detail": {"tool": "create_entities", "params": {"entities": ["Project"]}}}
+{"ts": 1760000001.0, "kind": "mcp.call", "detail": {"tool": "create_relations", "params": {"relations": ["depends_on"]}}}
+{"ts": 1760000002.0, "kind": "mcp.call", "detail": {"tool": "read_graph", "params": {}}}
+{"ts": 1760000003.0, "kind": "mcp.call", "detail": {"tool": "search_nodes", "params": {"query": "Project"}}}

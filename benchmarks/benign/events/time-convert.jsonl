@@ -1,0 +1,2 @@
+{"ts": 1760000000.0, "kind": "mcp.call", "detail": {"tool": "get_current_time", "params": {"timezone": "UTC"}}}
+{"ts": 1760000001.0, "kind": "mcp.call", "detail": {"tool": "convert_time", "params": {"from": "UTC", "to": "Asia/Bangkok"}}}

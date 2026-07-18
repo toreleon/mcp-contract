@@ -1,0 +1,10 @@
+{
+  "tools": [
+    {"name": "get_historical_stock_prices",
+     "description": "Fetch historical stock prices for a ticker over HTTP from the Yahoo Finance web API.",
+     "inputSchema": {"type":"object","properties":{"ticker":{"type":"string"},"start_date":{"type":"string"},"end_date":{"type":"string"}},"required":["ticker"]}},
+    {"name": "get_stock_info",
+     "description": "Fetch current company info and quote for a ticker over HTTP from the Yahoo Finance web API URL.",
+     "inputSchema": {"type":"object","properties":{"ticker":{"type":"string"}},"required":["ticker"]}}
+  ]
+}

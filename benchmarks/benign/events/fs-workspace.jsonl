@@ -1,0 +1,17 @@
+{"ts": 1760000000.0, "kind": "mcp.call", "detail": {"tool": "list_directory", "params": {"path": "/workspace"}}}
+{"ts": 1760000000.1, "kind": "fs.open", "detail": {"path": "/workspace", "mode": "r"}, "tool_ctx": "list_directory"}
+{"ts": 1760000001.0, "kind": "mcp.call", "detail": {"tool": "read_file", "params": {"path": "/workspace/README.md"}}}
+{"ts": 1760000001.1, "kind": "fs.open", "detail": {"path": "/workspace/README.md", "mode": "r"}, "tool_ctx": "read_file"}
+{"ts": 1760000002.0, "kind": "mcp.call", "detail": {"tool": "read_multiple_files", "params": {"paths": ["/workspace/a.py", "/workspace/b.py"]}}}
+{"ts": 1760000002.1, "kind": "fs.open", "detail": {"path": "/workspace/a.py", "mode": "r"}, "tool_ctx": "read_multiple_files"}
+{"ts": 1760000002.2, "kind": "fs.open", "detail": {"path": "/workspace/b.py", "mode": "r"}, "tool_ctx": "read_multiple_files"}
+{"ts": 1760000003.0, "kind": "mcp.call", "detail": {"tool": "create_directory", "params": {"path": "/workspace/build"}}}
+{"ts": 1760000003.1, "kind": "fs.open", "detail": {"path": "/workspace/build", "mode": "w"}, "tool_ctx": "create_directory"}
+{"ts": 1760000004.0, "kind": "mcp.call", "detail": {"tool": "write_file", "params": {"path": "/workspace/build/out.txt"}}}
+{"ts": 1760000004.1, "kind": "fs.open", "detail": {"path": "/workspace/build/out.txt", "mode": "w"}, "tool_ctx": "write_file"}
+{"ts": 1760000005.0, "kind": "mcp.call", "detail": {"tool": "edit_file", "params": {"path": "/workspace/a.py"}}}
+{"ts": 1760000005.1, "kind": "fs.open", "detail": {"path": "/workspace/a.py", "mode": "rw"}, "tool_ctx": "edit_file"}
+{"ts": 1760000006.0, "kind": "mcp.call", "detail": {"tool": "move_file", "params": {"source": "/workspace/a.py", "destination": "/workspace/src/a.py"}}}
+{"ts": 1760000006.1, "kind": "fs.open", "detail": {"path": "/workspace/src/a.py", "mode": "w"}, "tool_ctx": "move_file"}
+{"ts": 1760000007.0, "kind": "mcp.call", "detail": {"tool": "search_files", "params": {"path": "/workspace", "pattern": "*.py"}}}
+{"ts": 1760000007.1, "kind": "fs.open", "detail": {"path": "/workspace", "mode": "r"}, "tool_ctx": "search_files"}
