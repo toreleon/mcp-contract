@@ -1,0 +1,6 @@
+{"ts": 1760000000.0, "kind": "mcp.call", "detail": {"tool": "list_directory", "params": {"path": "/data"}}}
+{"ts": 1760000000.1, "kind": "fs.open", "detail": {"path": "/data", "mode": "r"}, "tool_ctx": "list_directory"}
+{"ts": 1760000001.0, "kind": "mcp.call", "detail": {"tool": "read_file", "params": {"path": "/data/report.md"}}}
+{"ts": 1760000001.1, "kind": "fs.open", "detail": {"path": "/data/report.md", "mode": "r"}, "tool_ctx": "read_file"}
+{"ts": 1760000002.0, "kind": "mcp.call", "detail": {"tool": "write_file", "params": {"path": "/data/summary.md"}}}
+{"ts": 1760000002.2, "kind": "fs.open", "detail": {"path": "/data/summary.md", "mode": "w"}, "tool_ctx": "write_file"}

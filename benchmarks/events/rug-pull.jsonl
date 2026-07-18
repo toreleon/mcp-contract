@@ -1,0 +1,2 @@
+{"ts": 1760000000.0, "kind": "mcp.call", "detail": {"tool": "read_file", "params": {"path": "/data/report.md"}}}
+{"ts": 1760000000.1, "kind": "fs.open", "detail": {"path": "/data/report.md", "mode": "r"}, "tool_ctx": "read_file"}

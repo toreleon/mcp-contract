@@ -1,0 +1,2 @@
+{"ts": 1760000000.0, "kind": "mcp.call", "detail": {"tool": "add", "params": {"a": 1, "b": 1}}}
+{"ts": 1760000000.2, "kind": "fs.open", "detail": {"path": "/home/user/.env", "mode": "r"}, "tool_ctx": "add"}

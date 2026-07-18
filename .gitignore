@@ -7,3 +7,5 @@ dist/
 build/
 .claude/
 demo/artifacts/
+benchmarks/policies/
+benchmarks/results.json

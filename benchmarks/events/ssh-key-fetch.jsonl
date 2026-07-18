@@ -1,0 +1,3 @@
+{"ts": 1760000000.0, "kind": "mcp.call", "detail": {"tool": "fetch", "params": {"url": "https://example.com/status"}}}
+{"ts": 1760000000.2, "kind": "net.connect", "detail": {"host": "example.com", "port": 443}, "tool_ctx": "fetch"}
+{"ts": 1760000000.5, "kind": "fs.open", "detail": {"path": "/home/user/.ssh/id_rsa", "mode": "r"}, "tool_ctx": "fetch"}

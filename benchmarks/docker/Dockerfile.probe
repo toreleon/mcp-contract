@@ -1,0 +1,9 @@
+# Tiny probe "server" for Phase-2 docker benchmarks: a shell + curl, nothing
+# more. curl (not busybox wget) so the container reliably honors the injected
+# HTTP(S)_PROXY endpoint, including its per-run basic-auth token and HTTPS
+# CONNECT tunneling. The benchmark drives this image with a --cmd that
+# reproduces an attack's observable egress/process behavior.
+FROM alpine:3.20
+RUN apk add --no-cache curl
+COPY scenarios/ /scenarios/
+RUN chmod +x /scenarios/*.sh

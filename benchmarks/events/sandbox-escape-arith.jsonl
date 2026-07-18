@@ -1,0 +1,2 @@
+{"ts": 1760000000.0, "kind": "mcp.call", "detail": {"tool": "multiply", "params": {"a": 3, "b": 4}}}
+{"ts": 1760000000.3, "kind": "proc.spawn", "detail": {"cmd": "echo 'hacked' > hacked"}, "tool_ctx": "multiply"}
